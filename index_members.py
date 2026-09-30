@@ -231,8 +231,9 @@ def fetch_monthly_snapshots(
     def one(month_start: pd.Timestamp):
         label = f"{month_start:%b%Y}"
         url = MONTHLY_ZIP_URL_TMPL.format(month_abbr=month_start.strftime("%b"), year=month_start.year)
+        worker_session = _http_session(HEADERS)
         try:
-            resp = session.get(url, timeout=20)
+            resp = worker_session.get(url, timeout=20)
             resp.raise_for_status()
             symbols = _symbols_from_zip(resp.content)
         except Exception as exc:  # noqa: BLE001
@@ -254,7 +255,7 @@ def fetch_wayback_snapshots(
 ) -> Dict[pd.Timestamp, Set[str]]:
     """{capture_date: symbols}, at most one capture per month per URL (constituents change twice a year)."""
     end = end or pd.Timestamp.today()
-    session = _http_session()
+    session = _http_session(HEADERS)
 
     captures: Dict[str, str] = {}  # wayback timestamp -> original url
     for target in WAYBACK_TARGETS[index_key]:
@@ -285,8 +286,9 @@ def fetch_wayback_snapshots(
 
     def one(item: Tuple[str, str]):
         ts, target = item
+        worker_session = _http_session(HEADERS)
         try:
-            resp = session.get(f"https://web.archive.org/web/{ts}if_/{target}", timeout=30)
+            resp = worker_session.get(f"https://web.archive.org/web/{ts}if_/{target}", timeout=30)
             resp.raise_for_status()
             symbols = _symbols_from_frame(pd.read_csv(io.StringIO(resp.text)))
         except Exception as exc:  # noqa: BLE001
@@ -586,6 +588,12 @@ def build_index_membership(
         ],
         ignore_index=True,
     )
+
+    if all_events.empty:
+        raise RuntimeError(
+            "No membership events were recovered. Refusing to create a historical membership file "
+            "that could silently become a survivorship-biased backtest."
+        )
 
     if diagnostics:
         _print_coverage_report(all_events, current)

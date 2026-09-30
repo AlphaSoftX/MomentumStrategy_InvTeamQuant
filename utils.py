@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 
 _LEVEL_RGB = {
     logging.DEBUG: (0, 255, 0),
@@ -8,7 +9,6 @@ _LEVEL_RGB = {
     logging.CRITICAL: (255, 0, 0),
 }
 
-
 class LoggerFormatter(logging.Formatter):
     def __init__(self):
         super().__init__("%(message)s")
@@ -16,7 +16,6 @@ class LoggerFormatter(logging.Formatter):
     def format(self, record):
         r, g, b = _LEVEL_RGB.get(record.levelno, (255, 255, 255))
         return f"\033[38;2;{r};{g};{b}m[{record.name}]\033[0m {super().format(record)}"
-
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -28,7 +27,5 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
         logger.propagate = False
     return logger
 
-
 def _safe_symbol(symbol: str) -> str:
-    """Filename-safe symbol; the single definition used by every module."""
-    return symbol.replace("/", "-").replace("^", "IDX_")
+    return str(symbol).replace("/", "-").replace("^", "IDX_").replace(":", "_")
