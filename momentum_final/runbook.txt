@@ -1,0 +1,32 @@
+RUN ORDER
+
+1) Install:
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+
+2) Build/diagnose membership:
+   python index_members.py --index nifty500 --data-dir data --diagnostics
+   python index_members.py --index nifty500 --data-dir data
+
+3) Run:
+   python main.py --index nifty500 --data-dir data --history-start 2008-01-01 --history-end 2023-12-31 --holdout-start 2021-01-01
+
+4) Update cached daily data later:
+   python data_loader.py --symbols RELIANCE.NS TCS.NS --start 2008-01-01 --update
+
+5) Research sweep:
+   import sweep_fix_k_n and call sweep()/walk_forward() using the point-in-time eligibility panel.
+   Never tune on the frozen holdout.
+
+KEY DIRECTORIES
+
+data/index_members/
+data/raw/1d/
+data/surveillance/
+data/results/
+
+PRODUCTION ENTRY POINTS
+
+main.py
+pipeline.py
