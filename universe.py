@@ -211,7 +211,6 @@ class Universe:
             list(symbols),
             period=config.YFINANCE_AVAILABILITY_PROBE_PERIOD,
             progress=False,
-            multi_level_index=True,
             threads=False,
             repair=config.YFINANCE_REPAIR,
             auto_adjust=False,

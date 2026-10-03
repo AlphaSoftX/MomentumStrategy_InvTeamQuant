@@ -29,7 +29,12 @@ run `--diagnostics` first and expect small fixes.
 from __future__ import annotations
 
 import argparse
+import difflib
 import io
+import random
+import re
+import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -85,6 +90,10 @@ EARLIEST_COVERAGE = pd.Timestamp("2000-01-01")  # floor for members with no disc
 SNAPSHOT_SIZE_TOLERANCE = 0.10                  # drop snapshots > 10% away from the median size
 SHADOW_WINDOW_DAYS = 45                         # approx event this close to an exact one is a duplicate
 
+PDF_MIN_RESOLVED = 475    # a PDF snapshot must resolve >= this many of ~500 names, else partial parsing would fake IN/OUT churn
+NAME_FUZZY_CUTOFF = 0.93
+SNAPSHOT_GAP_WARN_DAYS = 200
+
 _EVENT_COLS = ["symbol", "date", "action", "precision", "source"]
 
 
@@ -117,6 +126,79 @@ def _map_threads(fn: Callable, items, workers: int = 6) -> list:
 
 
 # --------------------------------------------------------------------------
+# Company-name -> ticker registry
+# Several NSE sources (IndexInclExcl.xls, old factsheet PDFs) identify stocks by NAME only.
+# Every CSV we parse that has both a name and a symbol feeds this registry.
+# --------------------------------------------------------------------------
+
+_NAME_MAP: Dict[str, str] = {}
+_NAME_LOCK = threading.Lock()
+_NAME_COL_HINTS = ["company name", "security name", "scrip name", "company"]
+
+
+def _norm_name(name) -> str:
+    s = str(name).lower().replace("&", " and ")
+    s = re.sub(r"\(.*?\)", " ", s)
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    s = re.sub(r"\b(limited|ltd|pvt|private|corporation|corp|company|co|inc)\b", " ", s)
+    return " ".join(s.split())
+
+
+def _register_names(df: pd.DataFrame) -> None:
+    sym_col = _find_col(df.columns, ["symbol"])
+    name_col = _find_col(df.columns, _NAME_COL_HINTS)
+    if not (sym_col and name_col):
+        return
+    syms = _to_yf_symbol(df[sym_col])
+    with _NAME_LOCK:
+        for n, sy in zip(df[name_col], syms):
+            if isinstance(sy, str) and pd.notna(n):
+                _NAME_MAP.setdefault(_norm_name(n), sy)
+
+
+def load_name_aliases(path: Path) -> int:
+    """Hand-curated name,symbol pairs (data/index_members/manual/name_aliases.csv). They take priority."""
+    if not path.exists():
+        return 0
+    raw = pd.read_csv(path)
+    syms = _to_yf_symbol(raw["symbol"])
+    with _NAME_LOCK:
+        for n, sy in zip(raw["name"], syms):
+            if isinstance(sy, str):
+                _NAME_MAP[_norm_name(n)] = sy
+    return len(raw)
+
+
+def resolve_name(name, fuzzy: bool = True) -> Optional[str]:
+    key = _norm_name(name)
+    if not key:
+        return None
+    with _NAME_LOCK:
+        hit = _NAME_MAP.get(key)
+        if hit or not fuzzy:
+            return hit
+        close = difflib.get_close_matches(key, list(_NAME_MAP), n=1, cutoff=NAME_FUZZY_CUTOFF)
+        return _NAME_MAP[close[0]] if close else None
+
+
+def _http_get(url: str, *, params=None, timeout: float = 30, attempts: int = 4, headers=None):
+    """GET with manual backoff. requests' Retry does not cover SSL/connection resets, which web.archive.org produces under load."""
+    last: Optional[Exception] = None
+    for i in range(1, attempts + 1):
+        target = url
+        if i == attempts and url.startswith("https://web.archive.org"):
+            target = "http://" + url[len("https://"):]  # last resort for flaky TLS in front of the archive
+        try:
+            resp = _http_session(headers or HEADERS).get(target, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            last = exc
+            time.sleep(1.5 * i + random.uniform(0, 1))
+    raise last  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------
 # Parsing helpers
 # --------------------------------------------------------------------------
 
@@ -137,6 +219,7 @@ def _to_yf_symbol(raw: pd.Series) -> pd.Series:
 
 
 def _symbols_from_frame(df: pd.DataFrame) -> Set[str]:
+    _register_names(df)
     col = _find_col(df.columns, ["symbol"])
     return set(_to_yf_symbol(df[col]).dropna()) if col else set()
 
@@ -161,8 +244,59 @@ def _events_frame(symbols, dates, actions, precision: str, source: str) -> pd.Da
 # Source 1: NSE IndexInclExcl.xls
 # --------------------------------------------------------------------------
 
-def fetch_incl_excl_events(session: requests.Session, index_key: str = "nifty500") -> pd.DataFrame:
-    """Exact IN/OUT events. Returns an empty frame (never raises) on any failure. Column names are matched fuzzily."""
+_OUT_RE = re.compile(r"excl|remov|delet|dropp|\bout\b|replac(ed|ing)? by", re.I)
+_IN_RE = re.compile(r"incl|add|insert|\bin\b|enter", re.I)
+
+
+def _classify_action(text: str) -> Optional[str]:
+    t = str(text)
+    if _OUT_RE.search(t):
+        return "OUT"
+    if _IN_RE.search(t):
+        return "IN"
+    return None
+
+
+def parse_incl_excl_frame(raw: pd.DataFrame, unresolved_sink: Optional[list] = None) -> pd.DataFrame:
+    """
+    Turns the IndexInclExcl sheet into exact IN/OUT events. The real sheet has columns
+    ['Index Name', 'Event Date', 'Scrip Name', 'Description'] - NAMES, not tickers - so names are resolved through
+    the registry fed by every CSV we parsed (plus manual aliases). Unresolvable rows are logged, never guessed.
+    """
+    raw = raw.copy()
+    raw.columns = [str(c).strip() for c in raw.columns]
+    symbol_col = _find_col(raw.columns, ["symbol"])
+    name_col = _find_col(raw.columns, ["scrip name", "company name", "security name", "company", "name"])
+    action_col = _find_col(raw.columns, ["description", "action", "inclusion", "exclusion", "type"])
+    date_col = _find_col(raw.columns, ["effective date", "event date", "date"])
+    if not date_col or not (symbol_col or name_col) or not action_col:
+        logger.warning(f"cannot identify columns (symbol={symbol_col}, name={name_col}, action={action_col}, date={date_col}); "
+                       f"columns were {list(raw.columns)}")
+        return _empty_events()
+
+    dates = pd.to_datetime(raw[date_col], errors="coerce")
+    actions = raw[action_col].map(_classify_action)
+    logger.info(f"IndexInclExcl action values (sample): {raw[action_col].astype(str).value_counts().head(5).to_dict()}")
+    if symbol_col:
+        symbols = _to_yf_symbol(raw[symbol_col])
+    else:
+        symbols = raw[name_col].map(resolve_name)
+
+    ok = symbols.notna() & dates.notna() & actions.notna()
+    n_total = int(dates.notna().sum())
+    n_unmapped = int((symbols.isna() & dates.notna()).sum())
+    n_unclassified = int((actions.isna() & dates.notna()).sum())
+    logger.info(f"IndexInclExcl: {int(ok.sum())}/{n_total} rows usable "
+                f"({n_unmapped} names not resolvable to a ticker, {n_unclassified} actions not classifiable)")
+    if unresolved_sink is not None and name_col:
+        bad = raw.loc[symbols.isna() & dates.notna(), [name_col, date_col, action_col]]
+        unresolved_sink.extend(bad.astype(str).values.tolist())
+    return _events_frame(symbols[ok], dates[ok], actions[ok], "exact", "nse_incl_excl_xls")
+
+
+def fetch_incl_excl_events(session: requests.Session, index_key: str = "nifty500",
+                           unresolved_sink: Optional[list] = None) -> pd.DataFrame:
+    """Exact IN/OUT events. Returns an empty frame (never raises) on any failure."""
     try:
         resp = session.get(INCL_EXCL_XLS_URL, timeout=20)
         resp.raise_for_status()
@@ -175,47 +309,101 @@ def fetch_incl_excl_events(session: requests.Session, index_key: str = "nifty500
     if sheet is None:
         logger.warning(f"none of {INCL_EXCL_SHEET_CANDIDATES} in workbook; sheets: {book.sheet_names}")
         return _empty_events()
-
     raw = book.parse(sheet)
-    raw.columns = [str(c).strip() for c in raw.columns]
     logger.info(f"IndexInclExcl.xls['{sheet}'] columns: {list(raw.columns)}")
-
-    symbol_col = _find_col(raw.columns, ["symbol"])
-    action_col = _find_col(raw.columns, ["action", "inclusion", "exclusion", "type"])
-    date_col = _find_col(raw.columns, ["effective date", "date"])
-    if not (symbol_col and date_col):
-        logger.warning(f"cannot identify symbol/date columns (got {symbol_col}, {date_col}); adjust _find_col hints")
-        return _empty_events()
-
-    symbols = _to_yf_symbol(raw[symbol_col])
-    dates = pd.to_datetime(raw[date_col], errors="coerce")
-    if action_col:
-        is_out = raw[action_col].astype(str).str.lower().str.contains("excl|remov|out", regex=True, na=False)
-    else:
-        is_out = pd.Series(False, index=raw.index)
-
-    valid = symbols.notna() & dates.notna()
-    events = _events_frame(
-        symbols[valid], dates[valid], np.where(is_out[valid], "OUT", "IN"), "exact", "nse_incl_excl_xls"
-    )
-    logger.info(f"IndexInclExcl.xls: {len(events)} events")
-    return events
+    return parse_incl_excl_frame(raw, unresolved_sink)
 
 
 # --------------------------------------------------------------------------
 # Sources 2-4: snapshots
 # --------------------------------------------------------------------------
 
+_NUM_TOKEN = re.compile(r"^[\d.,]+%?$")
+_PDF_NAME_RE = re.compile(r"(^|/)(cnx|nifty)_?500_[a-z]{3}\d{4}\.pdf$", re.I)
+
+
+def symbols_from_text_lines(lines: List[str], known_bare: Set[str]) -> Tuple[Set[str], List[str]]:
+    """
+    Pure function (unit-testable): factsheet text lines -> (resolved tickers, unresolved row-like lines).
+    A data row is recognised by a leading serial number or a trailing numeric (weight). The company name is the text
+    between them; it is resolved by name, else by a ticker-looking token that is a known symbol.
+    """
+    found: Set[str] = set()
+    unresolved: List[str] = []
+    for line in lines:
+        toks = line.split()
+        if len(toks) < 2:
+            continue
+        has_serial = bool(re.match(r"^\d{1,3}[.)]?$", toks[0]))
+        has_weight = bool(_NUM_TOKEN.match(toks[-1]))
+        if not (has_serial or has_weight):
+            continue
+        body = toks[1:] if has_serial else toks
+        while body and _NUM_TOKEN.match(body[-1]):      # strip trailing weight/price columns, keep numbers inside names ("360 ONE WAM")
+            body = body[:-1]
+        if not body:
+            continue
+        name_toks = body
+        sym = resolve_name(" ".join(body))              # full text, fuzzy allowed
+        if sym is None:                                  # name followed by extra columns (industry, series...): try prefixes, exact only
+            for k in range(len(body) - 1, 0, -1):
+                sym = resolve_name(" ".join(body[:k]), fuzzy=False)
+                if sym:
+                    break
+        if sym is None:
+            for t in body:
+                bare = re.sub(r"[^A-Z0-9&-]", "", t)
+                if len(bare) >= 2 and bare == t.strip(".,") and bare in known_bare:
+                    sym = bare + ".NS"
+                    break
+        if sym:
+            found.add(sym)
+        elif name_toks:
+            unresolved.append(" ".join(name_toks))
+    return found, unresolved
+
+
+def _pdf_lines(pdf_bytes: bytes) -> List[str]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        logger.warning("pypdf not installed: cannot read PDF snapshots (pip install pypdf)")
+        return []
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    out: List[str] = []
+    for page in reader.pages:
+        try:  # "layout" keeps table cells on one line; plain mode emits every cell as its own line
+            text = page.extract_text(extraction_mode="layout") or ""
+        except TypeError:  # older pypdf
+            text = page.extract_text() or ""
+        out.extend(ln.strip() for ln in text.splitlines() if ln.strip())
+    return out
+
+
+def _known_bare_symbols() -> Set[str]:
+    with _NAME_LOCK:
+        return {v[:-3] for v in _NAME_MAP.values() if v.endswith(".NS")}
+
+
 def _symbols_from_zip(zip_bytes: bytes) -> Set[str]:
-    """Inspect zf.namelist() on a real download and adjust the member match if this misses."""
+    """Older zips hold a Nifty 500 CSV; most (2013-05 onward) hold only factsheet PDFs, which are parsed best-effort."""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
-        candidates = [n for n in names if "500" in n.lower() and n.lower().endswith(".csv")]
-        if not candidates:
-            logger.warning(f"no Nifty 500 csv in zip; contents: {names}")
+        csvs = [n for n in names if "500" in n.lower() and n.lower().endswith(".csv")]
+        if csvs:
+            with zf.open(csvs[0]) as f:
+                return _symbols_from_frame(pd.read_csv(f))
+        pdfs = [n for n in names if _PDF_NAME_RE.search(n)]
+        if not pdfs:
+            logger.warning(f"no Nifty 500 csv/pdf in zip; contents: {names[:8]}...")
             return set()
-        with zf.open(candidates[0]) as f:
-            return _symbols_from_frame(pd.read_csv(f))
+        with zf.open(pdfs[0]) as f:
+            found, unresolved = symbols_from_text_lines(_pdf_lines(f.read()), _known_bare_symbols())
+        if len(found) < PDF_MIN_RESOLVED:
+            logger.warning(f"{pdfs[0]}: resolved only {len(found)} names ({len(unresolved)} unresolved); "
+                           f"snapshot rejected (need >= {PDF_MIN_RESOLVED}) to avoid fake IN/OUT churn")
+            return set()
+        return found
 
 
 def fetch_monthly_snapshots(
@@ -260,16 +448,14 @@ def fetch_wayback_snapshots(
     captures: Dict[str, str] = {}  # wayback timestamp -> original url
     for target in WAYBACK_TARGETS[index_key]:
         try:
-            resp = session.get(
+            resp = _http_get(
                 WAYBACK_CDX_URL,
                 params={
                     "url": target, "output": "json", "filter": "statuscode:200",
                     "from": start.strftime("%Y%m%d"), "to": end.strftime("%Y%m%d"),
                     "collapse": "timestamp:6",
                 },
-                timeout=30,
             )
-            resp.raise_for_status()
             rows = resp.json()
         except (requests.RequestException, ValueError) as exc:
             logger.warning(f"Wayback CDX lookup failed for {target}: {exc}")
@@ -286,10 +472,8 @@ def fetch_wayback_snapshots(
 
     def one(item: Tuple[str, str]):
         ts, target = item
-        worker_session = _http_session(HEADERS)
         try:
-            resp = worker_session.get(f"https://web.archive.org/web/{ts}if_/{target}", timeout=30)
-            resp.raise_for_status()
+            resp = _http_get(f"https://web.archive.org/web/{ts}if_/{target}")
             symbols = _symbols_from_frame(pd.read_csv(io.StringIO(resp.text)))
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"wayback capture {ts} failed: {exc}")
@@ -299,7 +483,7 @@ def fetch_wayback_snapshots(
         logger.info(f"wayback snapshot {ts[:8]}: {len(symbols)} symbols")
         return pd.Timestamp(ts[:8]), symbols
 
-    return dict(r for r in _map_threads(one, sorted(captures.items()), workers=4) if r)
+    return dict(r for r in _map_threads(one, sorted(captures.items()), workers=2) if r)
 
 
 def fetch_current_constituents(session: requests.Session, index_key: str = "nifty500") -> Set[str]:
@@ -331,17 +515,32 @@ def _drop_outlier_snapshots(snapshots: Dict[pd.Timestamp, Set[str]]) -> Dict[pd.
 
 
 def snapshots_to_events(snapshots: Dict[pd.Timestamp, Set[str]], source: str = "snapshot") -> pd.DataFrame:
-    """Diffs consecutive snapshots into approximate IN/OUT events dated at the later snapshot."""
+    """
+    Diffs consecutive snapshots into approximate IN/OUT events dated at the later snapshot.
+    Members of the FIRST snapshot get an IN event at EARLIEST_COVERAGE (precision "floor": start unknown). Without it a
+    stock that was in the first snapshot and later removed has only an OUT event, which build_intervals discards, so it
+    would vanish from history entirely (pure survivorship bias).
+    """
     dates = sorted(snapshots)
     syms: List[str] = []
     when: List[pd.Timestamp] = []
     acts: List[str] = []
+    precision: List[str] = []
+    if dates:
+        first = sorted(snapshots[dates[0]])
+        syms += first
+        when += [EARLIEST_COVERAGE] * len(first)
+        acts += ["IN"] * len(first)
+        precision += ["floor"] * len(first)
     for prev, cur in zip(dates[:-1], dates[1:]):
         added, removed = snapshots[cur] - snapshots[prev], snapshots[prev] - snapshots[cur]
         syms += [*added, *removed]
         when += [cur] * (len(added) + len(removed))
         acts += ["IN"] * len(added) + ["OUT"] * len(removed)
-    return _events_frame(syms, when, acts, "approx", source)
+        precision += ["approx"] * (len(added) + len(removed))
+    out = _events_frame(syms, when, acts, "approx", source)
+    out["precision"] = precision
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -411,6 +610,10 @@ def build_intervals(
         }
     )
     ev = _drop_shadowed_approx(all_events)
+    if not ev.empty and "precision" in ev.columns:
+        # "floor" = unknown start. If exact events exist for the symbol, they know better.
+        exact_syms = set(ev.loc[(ev["precision"] == "exact"), "symbol"])
+        ev = ev[~((ev["precision"] == "floor") & ev["symbol"].isin(exact_syms))]
     ev = ev[ev["action"].isin(("IN", "OUT"))][["symbol", "date", "action"]].copy()
     if not ev.empty:
         ev["date"] = pd.to_datetime(ev["date"])
@@ -565,7 +768,16 @@ def build_index_membership(
     diagnostics: bool = False,
 ) -> pd.DataFrame:
     data_dir = Path(data_dir)
+    members_dir = data_dir / config.INDEX_MEMBERS_SUBDIR
     session = _nse_session()
+
+    # Seed names->tickers first (and any hand-made aliases): several sources identify stocks by NAME only.
+    if DEFAULT_SEED_CSV.exists():
+        try:
+            _register_names(pd.read_csv(DEFAULT_SEED_CSV))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"seed csv not usable for name mapping: {exc}")
+    n_alias = load_name_aliases(members_dir / "manual" / "name_aliases.csv")
 
     current = fetch_current_constituents(session, index_key)
     if not current:
@@ -579,15 +791,23 @@ def build_index_membership(
     snapshots = _drop_outlier_snapshots(snapshots)
     snapshots[pd.Timestamp.today().normalize()] = current  # closes the gap between the last capture and today
 
-    manual_path = data_dir / config.INDEX_MEMBERS_SUBDIR / "manual" / f"{index_key}_manual_events.csv"
+    unresolved: list = []
+    manual_path = members_dir / "manual" / f"{index_key}_manual_events.csv"
     all_events = pd.concat(
         [
-            fetch_incl_excl_events(session, index_key),
+            fetch_incl_excl_events(session, index_key, unresolved),   # runs AFTER snapshots so the name registry is filled
             snapshots_to_events(snapshots),
             load_manual_events(manual_path),
         ],
         ignore_index=True,
     )
+
+    if unresolved:
+        out = members_dir / "unresolved_names.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(unresolved, columns=["name", "date", "description"]).to_csv(out, index=False)
+        logger.warning(f"{len(unresolved)} include/exclude rows could not be mapped to a ticker -> {out}. "
+                       f"Add 'name,symbol' rows to manual/name_aliases.csv and re-run.")
 
     if all_events.empty:
         raise RuntimeError(
@@ -596,23 +816,60 @@ def build_index_membership(
         )
 
     if diagnostics:
-        _print_coverage_report(all_events, current)
+        _print_coverage_report(all_events, current, snapshots, n_alias, len(unresolved))
 
     members = build_intervals(all_events, current)
     save_members(members, data_dir, index_key)
     return members
 
 
-def _print_coverage_report(all_events: pd.DataFrame, current: Set[str]) -> None:
+def _snapshot_gaps(snapshots: Dict[pd.Timestamp, Set[str]]) -> List[Tuple[pd.Timestamp, pd.Timestamp, int]]:
+    d = sorted(snapshots)
+    return [(a, b, (b - a).days) for a, b in zip(d[:-1], d[1:]) if (b - a).days > SNAPSHOT_GAP_WARN_DAYS]
+
+
+def _print_coverage_report(all_events, current, snapshots=None, n_alias=0, n_unresolved=0) -> None:
     print("\n--- coverage report ---")
     print(f"current constituents: {len(current)}")
     if all_events.empty:
         print("NO EVENTS FROM ANY SOURCE: check network/URLs above.")
         return
     for source, g in all_events.groupby("source"):
-        print(f"{source:>20}: {len(g):5d} events, {g['date'].min().date()} -> {g['date'].max().date()}")
+        exact = int((g["precision"] == "exact").sum())
+        print(f"{source:>20}: {len(g):5d} events ({exact} exact), {g['date'].min().date()} -> {g['date'].max().date()}")
     print(f"{'distinct symbols':>20}: {all_events['symbol'].nunique()}")
+    print(f"{'name aliases loaded':>20}: {n_alias}")
+    print(f"{'unmapped names':>20}: {n_unresolved}  (see unresolved_names.csv)")
+    if snapshots:
+        d = sorted(snapshots)
+        print(f"{'snapshots':>20}: {len(d)}, {d[0].date()} -> {d[-1].date()}")
+        gaps = _snapshot_gaps(snapshots)
+        if gaps:
+            print("\n  WARNING: large gaps between snapshots. Every membership change inside a gap is dated at the END of")
+            print("  the gap (look-ahead for additions) unless an exact event covers it:")
+            for a, b, days in gaps:
+                print(f"    {a.date()} -> {b.date()}  ({days // 30} months)")
     print("-----------------------\n")
+
+
+def inspect_month(month_abbr: str, year: int) -> None:
+    """Debug helper: download ONE monthly zip, show how its Nifty 500 PDF is read, and what fails to resolve."""
+    url = MONTHLY_ZIP_URL_TMPL.format(month_abbr=month_abbr, year=year)
+    resp = _http_get(url, headers=HEADERS)
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        pdfs = [n for n in zf.namelist() if _PDF_NAME_RE.search(n)]
+        print(f"zip entries matching Nifty 500: {pdfs}")
+        if not pdfs:
+            print(f"all entries: {zf.namelist()}")
+            return
+        lines = _pdf_lines(zf.read(pdfs[0]))
+    print(f"\n{len(lines)} text lines. First 40:")
+    for ln in lines[:40]:
+        print("   |", ln)
+    found, unresolved = symbols_from_text_lines(lines, _known_bare_symbols())
+    print(f"\nresolved {len(found)} symbols; {len(unresolved)} row-like lines unresolved. First 25 unresolved:")
+    for u in unresolved[:25]:
+        print("   ?", u)
 
 
 # --------------------------------------------------------------------------
@@ -626,12 +883,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--diagnostics", action="store_true", help="print a per-source coverage report")
     p.add_argument("--fake", action="store_true", help="placeholder membership from --seed-csv (NOT bias-free)")
     p.add_argument("--seed-csv", default=str(DEFAULT_SEED_CSV), help="CSV with a 'Symbol' column, for --fake")
+    p.add_argument("--inspect-month", metavar="MonYYYY", help="debug one monthly zip, e.g. Aug2013")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     data_dir = Path(args.data_dir)
+
+    if args.inspect_month:
+        if DEFAULT_SEED_CSV.exists():
+            _register_names(pd.read_csv(DEFAULT_SEED_CSV))
+        load_name_aliases(data_dir / config.INDEX_MEMBERS_SUBDIR / "manual" / "name_aliases.csv")
+        inspect_month(args.inspect_month[:3], int(args.inspect_month[3:]))
+        return
 
     if args.fake:
         seed = load_seed_csv(Path(args.seed_csv))

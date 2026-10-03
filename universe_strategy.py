@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 from core_index import build_core_basket
-from strategy import _make_weights, _turnover, _period_return
+from strategy import _make_weights, _turnover_full, _period_outcome, _full_weights, _drift
 
 def _basket_engine(
     monthly_prices, basket_fn, rebalance_dates,
@@ -23,23 +23,21 @@ def _basket_engine(
     peak = 1.0
     equity = [1.0]
     dates_out = [monthly_prices.index[start]]
-    prev_actual = pd.Series({"__CASH__": 1.0})
+    prev_full = pd.Series({"__CASH__": 1.0})
     recs = []
 
     for i in range(start, len(monthly_prices.index) - 1):
         d, nxt = monthly_prices.index[i], monthly_prices.index[i + 1]
         if d in reb_set:
             weights = _make_weights(rets, d, basket_fn(d), weighting, vol_window)
-        turnover = _turnover(
-            prev_actual.drop(labels="__CASH__", errors="ignore"),
-            1.0 - float(prev_actual.get("__CASH__", 0.0)),
-            weights, exposure,
-        )
+        new_full = _full_weights(weights, exposure)
+        turnover = _turnover_full(prev_full, new_full)
         cost = turnover * (tx_cost_bps + slippage_bps) / 10000.0
         equity[-1] *= max(0.0, 1.0 - cost)
 
-        gross, missing = _period_return(rets.loc[nxt], weights, missing_return_policy)
+        gross, missing, filled = _period_outcome(rets.loc[nxt], weights, missing_return_policy)
         new_eq = equity[-1] * (1.0 + exposure * gross)
+        prev_full, drifted = _drift(weights, exposure, filled)  # uses the exposure actually held
         peak = max(peak, new_eq)
         dd = new_eq / peak - 1.0
         if enable_dd_overlay:
@@ -48,10 +46,8 @@ def _basket_engine(
             elif new_eq >= peak:
                 exposure = 1.0
 
-        actual = weights * exposure
-        actual["__CASH__"] = 1.0 - exposure
-        prev_actual = actual
         recs.append({"date": d, "turnover": turnover, "n_holdings": len(weights), "missing_returns": missing, "drawdown": dd})
+        weights = drifted
         equity.append(new_eq)
         dates_out.append(nxt)
 

@@ -14,7 +14,9 @@ repair documented price inconsistencies where possible.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field as dc_field
@@ -45,6 +47,42 @@ INTRADAY_MAX_LOOKBACK_DAYS = {
 _TAIL_TOLERANCE = pd.Timedelta(days=4)
 _DAY = pd.Timedelta(days=1)
 
+# Messages yfinance records when Yahoo genuinely has nothing for a symbol/range.
+# Anything else (rate limit, HTTP 403/429, JSON decode error, timeout) is transient.
+_GENUINE_EMPTY_MARKERS = ("delisted", "no price data found", "no data found")
+
+
+def _pop_yf_error(symbol: str) -> str:
+    """yfinance does NOT raise on most failures: it returns an empty frame and stores the reason here."""
+    try:
+        import yfinance.shared as _shared
+        return str(_shared._ERRORS.pop(symbol, "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_genuine_empty(err: str) -> bool:
+    low = err.lower()
+    return (not low) or any(m in low for m in _GENUINE_EMPTY_MARKERS)
+
+
+def _supported_download_kwargs() -> dict:
+    """Only pass kwargs the installed yfinance understands (old versions reject multi_level_index)."""
+    wanted = {
+        "auto_adjust": False,
+        "actions": True,
+        "repair": config.YFINANCE_REPAIR,
+        "progress": False,
+        "multi_level_index": False,
+        "threads": False,
+    }
+    try:
+        params = set(inspect.signature(yf.download).parameters)
+    except (TypeError, ValueError):
+        return wanted
+    return {k: v for k, v in wanted.items() if k in params}
+
+
 def _require_yfinance():
     if yf is None:
         raise ImportError(
@@ -67,9 +105,10 @@ class DataLoader:
     data_dir: Path = dc_field(default_factory=lambda: config.DATA_DIR)
     max_retries: int = 3
     retry_backoff: float = 2.0
-    max_workers: int = 8
+    max_workers: int = 4  # Yahoo rate-limits aggressively; 8 parallel workers triggers silent empty responses
 
     def __post_init__(self):
+        self.failures: Dict[str, str] = {}
         self.data_dir = Path(self.data_dir)
         self.raw_dir = self.data_dir / config.RAW_SUBDIR
         self.raw_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +129,16 @@ class DataLoader:
             lambda sym: self._get_one(sym, start, end, interval, force_refresh), symbols
         )
         data = {s: df for s, df in zip(symbols, results) if df is not None and not df.empty}
+        n_fail = sum(1 for s in symbols if s in self.failures)
+        logger.info(f"loaded {len(data)}/{len(symbols)} symbols ({n_fail} transient failures, "
+                    f"{len(symbols) - len(data) - n_fail} with no data)")
+        if symbols and not data:
+            sample = next(iter(self.failures.values()), "Yahoo returned no data for any symbol")
+            raise RuntimeError(
+                f"No price data could be loaded for any of {len(symbols)} symbols. "
+                f"This is a download problem, not missing stocks. Typical cause: Yahoo rate-limit/403 or an outdated "
+                f"yfinance (pip install -U yfinance). First error: {sample}"
+            )
         return self._to_wide(data, field) if wide else data
 
     def update(self, symbols: Sequence[str], interval: str = "1d") -> None:
@@ -103,6 +152,7 @@ class DataLoader:
                 return fn(sym)
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"{sym} failed: {exc!r}")
+                self.failures[sym] = repr(exc)
                 return None
 
         if self.max_workers <= 1 or len(symbols) <= 1:
@@ -128,8 +178,11 @@ class DataLoader:
             logger.info(f"{symbol} cache starts after requested start; re-downloading")
 
         df = self._download_with_retry(symbol, start, None, interval)
-        if df is None or df.empty:
-            logger.warning(f"{symbol} no data returned, skipping")
+        if df is None:
+            logger.warning(f"{symbol} download FAILED (transient); not caching, will retry next run")
+            return self._slice(cached, start, end) if cached is not None else None
+        if df.empty:
+            logger.warning(f"{symbol} Yahoo has no data for this symbol/range, skipping")
             return self._slice(cached, start, end) if cached is not None else None
 
         self._write_cache(df, path, start_ts, self._target(None))
@@ -149,7 +202,11 @@ class DataLoader:
         cov_start, cov_through = self._coverage(cached, path)
         last = self._naive(cached.index.max())
         new = self._download_with_retry(symbol, last.strftime("%Y-%m-%d"), end, interval)
-        if new is None or new.empty:
+        if new is None:
+            # transient failure: leave coverage untouched so the next run retries the tail
+            return cached
+        if new.empty:
+            # genuine empty (delisted / no newer bars): only then mark the tail as covered
             if target - last > pd.Timedelta(days=config.MAX_STALENESS_DAYS):
                 self._write_meta(path, cov_start, max(cov_through, target))
             return cached
@@ -160,37 +217,46 @@ class DataLoader:
         return combined
 
     def _download_with_retry(self, symbol, start, end, interval):
+        """Returns a non-empty frame, an EMPTY frame (Yahoo genuinely has nothing), or None (transient failure)."""
         _require_yfinance()
         self._check_intraday_lookback(start, interval)
+        kwargs = _supported_download_kwargs()
+        last_err = ""
         for attempt in range(1, self.max_retries + 1):
             try:
-                df = yf.download(
-                    symbol,
-                    start=start,
-                    end=end,
-                    interval=interval,
-                    auto_adjust=False,
-                    actions=True,
-                    repair=config.YFINANCE_REPAIR,
-                    progress=False,
-                    multi_level_index=False,
-                    threads=False,
-                )
-                if df is None:
-                    df = pd.DataFrame()
-                df = _flatten_columns(df)
-                if not df.empty:
-                    idx = pd.DatetimeIndex(pd.to_datetime(df.index))
-                    df.index = idx.tz_localize(None) if idx.tz is not None else idx
-                    df = df[~df.index.duplicated(keep="last")].sort_index()
+                _pop_yf_error(symbol)
+                df = yf.download(symbol, start=start, end=end, interval=interval, **kwargs)
+            except TypeError:
+                raise  # programming/version error: never mask it as "no data"
+            except Exception as exc:  # noqa: BLE001
+                last_err = repr(exc)
+                logger.warning(f"{symbol} download raised (attempt {attempt}): {exc}")
+                self._sleep_backoff(attempt)
+                continue
+            if df is None:
+                df = pd.DataFrame()
+            df = _flatten_columns(df)
+            if not df.empty:
+                idx = pd.DatetimeIndex(pd.to_datetime(df.index))
+                df.index = idx.tz_localize(None) if idx.tz is not None else idx
+                df = df[~df.index.duplicated(keep="last")].sort_index()
+                df.index.name = "Date"
+                self.failures.pop(symbol, None)
+                return df
+            err = _pop_yf_error(symbol)
+            if _is_genuine_empty(err):
+                self.failures.pop(symbol, None)
                 df.index.name = "Date"
                 return df
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"{symbol} download failed (attempt {attempt}): {exc}")
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_backoff * attempt)
-        logger.error(f"{symbol} all {self.max_retries} download attempts failed")
+            last_err = err
+            logger.warning(f"{symbol} empty response with error (attempt {attempt}): {err[:120]}")
+            self._sleep_backoff(attempt)
+        self.failures[symbol] = last_err or "unknown download failure"
+        logger.error(f"{symbol} all {self.max_retries} download attempts failed: {last_err[:200]}")
         return None
+
+    def _sleep_backoff(self, attempt):
+        time.sleep(self.retry_backoff * attempt + random.uniform(0, 1.0))
 
     @staticmethod
     def _check_intraday_lookback(start, interval):

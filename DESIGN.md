@@ -192,3 +192,46 @@ No model should be retrained inside a loop over individual securities.
 3. Surveillance history is still optional because no builder for that dataset was supplied.
 4. Exact delisting proceeds are not available from the supplied free data, so missing-held-return handling is
    explicitly conservative rather than silently optimistic.
+
+## 20. Audit fixes (second pass)
+
+1. **Silent "no data for any stock" (data_loader.py).** yfinance does not raise when Yahoo rate-limits/blocks or the
+   installed version is stale; it returns an empty frame and records the reason in `yfinance.shared._ERRORS`. The loader
+   treated that as "no data, skip" and never retried. Now: an empty frame with a non-"delisted" error is a transient failure
+   (retried with jittered backoff, returns `None`, never cached); a genuine "delisted/no price data" empty frame is accepted;
+   `get_data` raises a clear `RuntimeError` when nothing at all loads. Default workers 8 -> 4.
+2. **Version-incompatible kwargs** (`multi_level_index` on old yfinance) used to raise `TypeError` that was swallowed and
+   retried as "no data". Kwargs are now filtered by the installed `yf.download` signature; `TypeError` is never masked.
+3. **Cache poisoning.** A failed tail extension used to advance the coverage sidecar to "yesterday", so the missing
+   tail was never fetched again. Coverage now advances only on a genuine empty response.
+4. **Turnover ignored weight drift** (engine compared new target weights to the previous *target*, not to the drifted
+   holdings), understating turnover and costs; non-rebalance months were also silently re-equalised for free. The engine now
+   drifts holdings buy-and-hold and charges turnover on full weights including cash. The old `_turnover` also applied
+   exposure twice when the drawdown overlay was on; `universe_strategy.py` additionally used the post-update exposure.
+5. **Sortino** used the std of only the negative returns; it now uses standard downside deviation.
+6. `mask_panel` vectorised (was a per-row `.loc` loop). `requirements.txt`: `yfinance>=0.2.54`, `scipy` (needed by `repair=True`).
+
+Not changed, but worth deciding: `TX_COST_BPS + SLIPPAGE_BPS` is charged on one-way turnover. If 15 bps is meant per side,
+true cost is ~2x. Sharpe/Sortino use a 0% risk-free rate. Training labels drop stocks that vanish (survivorship in the
+fit) while the portfolio charges them -100%; the two are inconsistent but the portfolio side is the conservative one.
+
+## 21. Membership builder audit (from a real `--diagnostics` run)
+
+Observed on a live run: only the Apr-2013 monthly zip contained a CSV (all later zips hold factsheet PDFs only);
+IndexInclExcl.xls has columns `Index Name, Event Date, Scrip Name, Description` (company NAMES, no ticker) so it
+produced zero events; 4 Wayback fetches died with SSL errors. Net effect: membership history was one snapshot in 2013,
+then nothing until 2022.
+
+1. **First-snapshot survivorship bug.** Members of the first snapshot got no IN event, so one that was later removed had only
+   an OUT event, which `build_intervals` discards: it vanished from history. First-snapshot members now get an IN at
+   `EARLIEST_COVERAGE` (precision `floor`), and a `floor` IN never overrides exact events for the same symbol.
+2. **Name->ticker registry.** Every parsed CSV with name+symbol feeds it; `manual/name_aliases.csv` (`name,symbol`) overrides.
+   The xls is parsed by name (`Description` is the action column); unmappable rows go to `unresolved_names.csv`, never guessed.
+3. **PDF snapshots** are parsed best-effort (pypdf layout mode). A PDF snapshot must resolve >= 475 names or it is rejected,
+   because a partial parse would emit hundreds of fake IN/OUT events. Debug a month with
+   `python index_members.py --inspect-month Aug2013`.
+4. **Wayback**: manual backoff retries (SSL resets are not covered by urllib3 Retry), 2 workers, http fallback on last try.
+5. The coverage report now lists snapshot gaps > 200 days: any change inside a gap is dated at the gap's end.
+
+Known limit: companies that left the index and were later delisted/renamed appear in no current CSV, so their names cannot
+be mapped to tickers automatically. Use `unresolved_names.csv` + `name_aliases.csv` for the ones that matter.

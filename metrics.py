@@ -11,8 +11,9 @@ def compute_metrics(equity_curve, periods_per_year=12):
     cagr = final ** (1.0 / n_years) - 1.0 if n_years > 0 and final > 0 else np.nan
     ann_vol = rets.std(ddof=1) * np.sqrt(periods_per_year)
     sharpe = (rets.mean() * periods_per_year) / ann_vol if ann_vol > 0 else np.nan
-    downside = rets[rets < 0]
-    downside_vol = downside.std(ddof=1) * np.sqrt(periods_per_year) if len(downside) > 1 else np.nan
+    # Standard downside deviation: RMS of below-target (0) returns over ALL periods,
+    # not the std of only the negative returns (which collapses toward 0 for a few similar losses).
+    downside_vol = float(np.sqrt((np.minimum(rets, 0.0) ** 2).mean()) * np.sqrt(periods_per_year))
     sortino = (rets.mean() * periods_per_year) / downside_vol if downside_vol > 0 else np.nan
     drawdown = eq / eq.cummax() - 1.0
     max_dd = float(drawdown.min())

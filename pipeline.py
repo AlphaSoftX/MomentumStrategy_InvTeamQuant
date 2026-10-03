@@ -43,14 +43,11 @@ def build_pit_eligibility(prices, universe_obj, index_name):
     return mask.reindex(index=monthly.index, columns=prices.columns, fill_value=False)
 
 def mask_panel(panel, eligibility):
-    keep = []
-    for date, ticker in panel.index:
-        keep.append(
-            date in eligibility.index
-            and ticker in eligibility.columns
-            and bool(eligibility.loc[date, ticker])
-        )
-    return panel.loc[np.asarray(keep, dtype=bool)]
+    """Keep only (date, ticker) rows that are point-in-time eligible (vectorised)."""
+    flat = eligibility.stack(future_stack=True)
+    flat.index.names = ["date", "ticker"]
+    keep = flat.reindex(panel.index).fillna(False).astype(bool)
+    return panel.loc[keep.to_numpy()]
 
 def _run_portfolio(monthly, scores, eligibility, k):
     equity, turnover = strategy.run_strategy(

@@ -20,17 +20,14 @@ def _make_weights(monthly_rets, date, selected, weighting, vol_window):
     total = inv.sum()
     return inv / total if total > 0 else pd.Series(1.0 / len(selected), index=selected, dtype=float)
 
-def _turnover(old_stock, old_exposure, new_stock, new_exposure):
-    names = old_stock.index.union(new_stock.index)
-    old_risky = old_stock.reindex(names, fill_value=0.0) * float(old_exposure)
-    new_risky = new_stock.reindex(names, fill_value=0.0) * float(new_exposure)
-    old_cash = 1.0 - float(old_exposure)
-    new_cash = 1.0 - float(new_exposure)
-    return 0.5 * (
-        (new_risky - old_risky).abs().sum() + abs(new_cash - old_cash)
-    )
+def _turnover_full(prev_full, new_full):
+    """One-way turnover 0.5*sum|w_new - w_prev| on FULL portfolio weights (risky names + '__CASH__')."""
+    names = prev_full.index.union(new_full.index)
+    diff = new_full.reindex(names, fill_value=0.0) - prev_full.reindex(names, fill_value=0.0)
+    return 0.5 * float(diff.abs().sum())
 
-def _period_return(rets, weights, policy):
+def _period_outcome(rets, weights, policy):
+    """Returns (gross_return, n_missing, filled_returns) for a basket held over one period."""
     valid = rets.reindex(weights.index)
     missing = valid.isna()
     n_missing = int(missing.sum())
@@ -44,7 +41,35 @@ def _period_return(rets, weights, policy):
         else:
             raise ValueError("missing_return_policy must be 'liquidate', 'raise', or 'zero'")
     gross = float((weights * valid).sum())
+    return gross, n_missing, valid
+
+def _period_return(rets, weights, policy):
+    gross, n_missing, _ = _period_outcome(rets, weights, policy)
     return gross, n_missing
+
+def _full_weights(weights, exposure):
+    """Basket weights scaled by exposure, plus the cash remainder."""
+    risky = weights * float(exposure)
+    out = risky.copy()
+    out["__CASH__"] = 1.0 - float(risky.sum())
+    return out
+
+def _drift(weights, exposure, filled_rets):
+    """
+    Buy-and-hold drift over one period. Returns (prev_full, next_basket):
+      prev_full   - full portfolio weights (incl. cash) at the END of the period, before any trading
+      next_basket - basket weights renormalised to sum to 1 (what we hold if we do not rebalance)
+    """
+    risky_end = weights * float(exposure) * (1.0 + filled_rets.reindex(weights.index))
+    cash_end = 1.0 - float((weights * float(exposure)).sum())
+    total = float(risky_end.sum()) + cash_end
+    if total <= 0:
+        return pd.Series({"__CASH__": 1.0}), pd.Series(dtype=float)
+    prev_full = risky_end / total
+    prev_full["__CASH__"] = cash_end / total
+    basket_total = float(risky_end.sum())
+    next_basket = risky_end / basket_total if basket_total > 0 else pd.Series(dtype=float)
+    return prev_full, next_basket
 
 def run_strategy(
     monthly_prices,
@@ -81,7 +106,7 @@ def run_strategy(
     peak = 1.0
     equity = [1.0]
     dates_out = [all_months[start_idx]]
-    prev_actual = pd.Series({"__CASH__": 1.0})
+    prev_full = pd.Series({"__CASH__": 1.0})
     records = []
 
     for idx in range(start_idx, len(all_months) - 1):
@@ -99,22 +124,16 @@ def run_strategy(
             selected = candidates.sort_values(ascending=False).head(n_select).index
             weights = _make_weights(monthly_rets, this_date, selected, weighting, vol_window)
 
-        actual = weights * exposure
-        cash = 1.0 - exposure
-        actual_for_turnover = actual.copy()
-        actual_for_turnover["__CASH__"] = cash
-        turnover = _turnover(
-            prev_actual.drop(labels="__CASH__", errors="ignore"),
-            1.0 - float(prev_actual.get("__CASH__", 0.0)),
-            weights,
-            exposure,
-        )
+        new_full = _full_weights(weights, exposure)
+        turnover = _turnover_full(prev_full, new_full)
         cost = turnover * (float(tx_cost_bps) + float(slippage_bps)) / 10000.0
         equity[-1] *= max(0.0, 1.0 - cost)
 
-        gross_ret, n_missing = _period_return(monthly_rets.loc[next_date], weights, missing_return_policy)
+        gross_ret, n_missing, filled = _period_outcome(monthly_rets.loc[next_date], weights, missing_return_policy)
         port_ret = exposure * gross_ret
         new_eq = equity[-1] * (1.0 + port_ret)
+        # weights AFTER price moves, using the exposure that was actually held this period
+        prev_full, drifted_basket = _drift(weights, exposure, filled)
 
         peak = max(peak, new_eq)
         dd = new_eq / peak - 1.0
@@ -135,7 +154,7 @@ def run_strategy(
             "drawdown": dd,
             "rebalanced": rebalanced,
         })
-        prev_actual = actual_for_turnover
+        weights = drifted_basket  # buy-and-hold until the next rebalance date
         equity.append(new_eq)
         dates_out.append(next_date)
 
