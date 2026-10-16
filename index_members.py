@@ -225,7 +225,13 @@ def _symbols_from_frame(df: pd.DataFrame) -> Set[str]:
 
 
 def _empty_events() -> pd.DataFrame:
-    return pd.DataFrame(columns=_EVENT_COLS)
+    return pd.DataFrame({
+        "symbol": pd.Series(dtype=object),
+        "date": pd.Series(dtype="datetime64[ns]"),
+        "action": pd.Series(dtype=object),
+        "precision": pd.Series(dtype=object),
+        "source": pd.Series(dtype=object),
+    })
 
 
 def _events_frame(symbols, dates, actions, precision: str, source: str) -> pd.DataFrame:
@@ -274,7 +280,10 @@ def parse_incl_excl_frame(raw: pd.DataFrame, unresolved_sink: Optional[list] = N
                        f"columns were {list(raw.columns)}")
         return _empty_events()
 
-    dates = pd.to_datetime(raw[date_col], errors="coerce")
+    dates = pd.to_datetime(raw[date_col], errors="coerce", format="mixed", dayfirst=True)
+    n_bad_dates = int(dates.isna().sum() - raw[date_col].isna().sum())
+    if n_bad_dates:
+        logger.warning(f"{n_bad_dates} rows have an unparseable date, e.g. {raw.loc[dates.isna() & raw[date_col].notna(), date_col].head(5).tolist()}")
     actions = raw[action_col].map(_classify_action)
     logger.info(f"IndexInclExcl action values (sample): {raw[action_col].astype(str).value_counts().head(5).to_dict()}")
     if symbol_col:
@@ -533,11 +542,14 @@ def snapshots_to_events(snapshots: Dict[pd.Timestamp, Set[str]], source: str = "
         acts += ["IN"] * len(first)
         precision += ["floor"] * len(first)
     for prev, cur in zip(dates[:-1], dates[1:]):
-        added, removed = snapshots[cur] - snapshots[prev], snapshots[prev] - snapshots[cur]
-        syms += [*added, *removed]
-        when += [cur] * (len(added) + len(removed))
-        acts += ["IN"] * len(added) + ["OUT"] * len(removed)
-        precision += ["approx"] * (len(added) + len(removed))
+        # Presence is direct evidence of membership on `cur`, so assert IN for EVERY member of the snapshot, not just
+        # the newly added. Repeated INs collapse in build_intervals, but an exact OUT that falls between two snapshots
+        # (member -> out -> back in, both snapshots show it present) is otherwise never undone.
+        present, removed = sorted(snapshots[cur]), snapshots[prev] - snapshots[cur]
+        syms += [*present, *removed]
+        when += [cur] * (len(present) + len(removed))
+        acts += ["IN"] * len(present) + ["OUT"] * len(removed)
+        precision += ["approx"] * (len(present) + len(removed))
     out = _events_frame(syms, when, acts, "approx", source)
     out["precision"] = precision
     return out
@@ -618,6 +630,15 @@ def build_intervals(
     if not ev.empty:
         ev["date"] = pd.to_datetime(ev["date"])
         ev = ev.sort_values(["symbol", "date"]).reset_index(drop=True)  # multi-key sort is stable
+
+        first_rows = ev.groupby("symbol", sort=False).head(1)
+        orphans = first_rows[first_rows["action"] == "OUT"]
+        if len(orphans):
+            logger.info(f"{len(orphans)} symbols have an OUT with no earlier IN; assuming membership from {EARLIEST_COVERAGE.date()}")
+            ev = pd.concat(
+                [ev, pd.DataFrame({"symbol": orphans["symbol"].to_numpy(), "date": EARLIEST_COVERAGE, "action": "IN"})],
+                ignore_index=True,
+            ).sort_values(["symbol", "date"], kind="stable").reset_index(drop=True)
 
         seen_in = ev["action"].eq("IN").astype(int).groupby(ev["symbol"]).cummax().astype(bool)
         ev = ev[seen_in].reset_index(drop=True)
@@ -737,7 +758,8 @@ def explode_intervals(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndar
     """
     symbol/intervals table -> parallel arrays (symbols, starts, ends), one row per interval, so a
     point-in-time or overlap query is a single vectorised comparison. Open ends (NaT) become
-    Timestamp.max. Shared with universe.py.
+    Timestamp.max. Intervals are [start, end): `end` (the OUT date) is the first day the stock is NOT a member.
+    Shared with universe.py.
     """
     symbols, starts, ends = [], [], []
     for symbol, intervals in zip(df["symbol"], df["intervals"]):
@@ -755,7 +777,7 @@ def explode_intervals(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndar
 def members_as_of(df: pd.DataFrame, date: pd.Timestamp) -> Set[str]:
     symbols, starts, ends = explode_intervals(df)
     d64 = pd.Timestamp(date).to_datetime64()
-    return set(symbols[(starts <= d64) & (ends >= d64)].tolist())
+    return set(symbols[(starts <= d64) & (ends > d64)].tolist())  # end exclusive: OUT date = first non-member day
 
 
 # --------------------------------------------------------------------------
@@ -777,6 +799,12 @@ def build_index_membership(
             _register_names(pd.read_csv(DEFAULT_SEED_CSV))
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"seed csv not usable for name mapping: {exc}")
+    for extra in sorted((members_dir / "names").glob("*.csv")):  # e.g. NSE EQUITY_L.csv: NAME OF COMPANY, SYMBOL
+        try:
+            _register_names(pd.read_csv(extra))
+            logger.info(f"name registry extended from {extra.name}: {len(_NAME_MAP)} names")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"{extra} not usable for name mapping: {exc}")
     n_alias = load_name_aliases(members_dir / "manual" / "name_aliases.csv")
 
     current = fetch_current_constituents(session, index_key)
@@ -793,14 +821,15 @@ def build_index_membership(
 
     unresolved: list = []
     manual_path = members_dir / "manual" / f"{index_key}_manual_events.csv"
-    all_events = pd.concat(
-        [
-            fetch_incl_excl_events(session, index_key, unresolved),   # runs AFTER snapshots so the name registry is filled
-            snapshots_to_events(snapshots),
-            load_manual_events(manual_path),
-        ],
-        ignore_index=True,
-    )
+    frames = [
+        fetch_incl_excl_events(session, index_key, unresolved),   # runs AFTER snapshots so the name registry is filled
+        snapshots_to_events(snapshots),
+        load_manual_events(manual_path),
+    ]
+    # Empty frames must not take part in concat: they can turn `date` into object dtype and break merge_asof.
+    all_events = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(not f.empty for f in frames) else _empty_events()
+    if not all_events.empty:
+        all_events["date"] = pd.to_datetime(all_events["date"])
 
     if unresolved:
         out = members_dir / "unresolved_names.csv"
@@ -815,10 +844,22 @@ def build_index_membership(
             "that could silently become a survivorship-biased backtest."
         )
 
+    n_hist_snapshots = len(snapshots) - 1  # today's anchor does not count as history
+    n_exact = int((all_events["precision"] == "exact").sum())
+    if n_hist_snapshots < 2 and n_exact == 0:
+        raise RuntimeError(
+            "No historical evidence (no exact events, <2 historical snapshots): result would be today's list projected "
+            "back to 2000, i.e. fully survivorship-biased. Fix the fetchers or use --fake knowingly."
+        )
+
     if diagnostics:
         _print_coverage_report(all_events, current, snapshots, n_alias, len(unresolved))
 
     members = build_intervals(all_events, current)
+    if diagnostics:
+        print("members_as_of size check (should be ~500 on every date):")
+        for y in range(2008, pd.Timestamp.today().year + 1):
+            print(f"   {y}-01-01: {len(members_as_of(members, pd.Timestamp(f'{y}-01-01')))}")
     save_members(members, data_dir, index_key)
     return members
 
